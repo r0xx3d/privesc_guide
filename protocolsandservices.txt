@@ -1,0 +1,69 @@
+//network protocols and services
+
+
+telnet <ip-address>       
+
+capture http info using telnet on port 80
+
+telnet <ip-address> <port>
+GET /path HTTP/1.1                      
+host: telnet                 //press enter twice
+
+
+//common ftp commands
+
+use ftp using telnet client on port 21
+
+STAT             //added info
+SYST             //system info
+TYPE A          //file transfer mode to ASCII
+TYPE I          //file transfer mode to binary
+
+telnet <ip> 21
+USER <username>
+PASS <password>
+
+ftp <ip>
+name: <username>
+password: <password>
+ls
+ascii or binary
+get <filename>
+
+//FTP server softwares
+vsftpd
+ProFTPD
+uFTP
+
+//using smtp (client(MSA) for contacting MTA)
+
+telnet <ip> 25
+helo <hostname>           //telnet here
+mail from: <sender>
+rcpt to: <reciever>
+
+//press enter twice to issure <CR><LF>.<CR><LF>
+
+
+//using POP3   (client for downloading mail from MDA)
+
+STAT            //postitive response in format +OK nn mm (nn: number of emails, mm: size of inbox)
+
+LIST
+RETR <num>
+
+//IMAP for synchronization
+
+//using scp(secure copy protocol)
+
+scp <username>@<ip>:/path/file.gz ~              //will copy /path/file.gz and put it in your ~ directory
+
+scp file.gz <username>@<ip>:/path/to_save/        //will copy file.gz from local system to a remote system
+
+
+
+//using hydra for brute forcing protocols
+
+hydra -l <username> -P <wordlist> <server> <service-type>
+
+some extra settings: -s <port>, -V (verbosity), -t <number-of-threads>, -d (for debugging)

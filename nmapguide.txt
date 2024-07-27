@@ -1,0 +1,83 @@
+-sN    null scan: no response implies the presence of open port or firewall blockage
+-sF    fin scan: no response immplies the presence of open port or firewall blockage
+-sX    xmas scan: uses the fin, psh and urg flag, looks like a christmas tree. rst response implies closed port,   no response implies open|filtered port
+
+-sM    maimon scan: sets fin/ack bit
+
+-sA    tcp ack scan: used to recognize which port is not blocked by firewall
+-sW    window scan: almost like tcp ack scan but the rst flag in response is returned with a window field which may recognize open ports in specific systems
+
+--scanflag  set custom flags: URGACKPSHSYNFINRST
+
+//port scanning using spoofed IP
+
+nmap -e NET_INTERFACE -Pn -S SPOOFED_IP <IP>
+
+--spoof-mac SPOOFED_MAC          //works if on the same subnet
+
+-D ip1,ip2,ip3,ip4,my-ip                              //use random ip addresses as decoy 
+
+//packet fragmentation for evading traditional firewall and ids
+
+-f     //will fragment the packet in 8 bytes
+-f -f or -ff     //will fragment the packet into 16 bytes
+
+--mtu            //change the default value of fragmentation.*it is recommended to keep the default value as a multiple of 8*
+
+--data-length NUM     //increase the size of packet fragments make them appear harmless
+--source-port PORT_NUM
+
+-sI         idle/zombie scan
+
+--reason
+-d        //debugging
+-dd       //more debugging info
+
+
+//post port scanning
+
+-sV       //service detection
+-sV --version-intensity level          // 1 to 10
+-sV --version-light                  //level 2
+-sV --version-all                      //level 9
+
+
+-sS                                    //syn stealth scan
+-sS -O <ip-address>                   //os detection
+
+
+nmap scripting engine
+
+--script=default or -sC
+
+//script categories
+auth
+broadcast
+brute
+default
+discovery
+dos
+exploit
+external
+fuzzer
+intrusive
+malware
+safe
+version
+vuln
+
+--script "<script-name>"        //specify script name: scripts located at /usr/share/nmap/scripts
+
+--script "ftp*"                 //specify pattern(would include ftp-brute)
+
+//read a text file for script description using less command
+
+//saving files
+
+-oN <filename>       //normal file save
+-oG <filname>        //grepable file save, less words but still meaningful( grep <keyword> <text-file> )
+
+-oX <filename>       //xml file save
+-oA <filename>       //scan output in all three formats
+
+-oS <filename>       //completely useless scan for script kiddies, ugh
